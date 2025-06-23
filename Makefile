@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -g -Wall -Wextra -std=c11 $(shell pkg-config --cflags gtk+-3.0)
-LDFLAGS = $(shell pkg-config --libs gtk+-3.0)
+LDFLAGS = -lcrypto $(shell pkg-config --libs gtk+-3.0)
 
 OBJ = interface/interface.o \
       port_scanner/port_scanner.o \
