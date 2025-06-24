@@ -11,13 +11,20 @@
 #include <errno.h>
 #include <pwd.h>
 #include <grp.h>
+#include <unistd.h>
 #include "../utils/utils.h"
 
-#define MOUNT_DIR "/media"
+#define MOUNT_DIR "/media/abraham"
 #define ALT_MOUNT_DIR "/run/media"
 #define MAX_PATH 4096
 #define HASH_SIZE (SHA256_DIGEST_LENGTH * 2 + 1)
 #define CHANGE_THRESHOLD 10
+#define MAX_FILE_SIZE (100 * 1024 * 1024)
+#define MAX_HASH_BYTES (20 * 1024 * 1024)
+#define MAX_DEPTH 10
+#define MAX_FILES_PER_SCAN 2000
+
+static int total_files_scanned = 0;
 
 typedef struct {
     char path[MAX_PATH];
@@ -29,13 +36,25 @@ typedef struct {
     time_t mtime;
 } FileEntry;
 
+typedef struct {
+    char mount_path[MAX_PATH];
+    FileEntry *baseline;
+    int baseline_count;
+    int baseline_capacity;
+} BaselineInfo;
+
+#define MAX_DEVICES 10
+static BaselineInfo dispositivos[MAX_DEVICES];
+static int num_dispositivos = 0;
+
 char *generar_reporte_usb();
-void scan_directory(const char *path, FileEntry **out_list, int *out_count);
-void compute_sha256(const char *file_path, char *output);
+void scan_directory(const char *path, FileEntry **out_list, int *out_count, int *capacity, int depth);
+void compute_sha256(const char *file_path, char *output, off_t file_size);
 void detect_changes(FileEntry *baseline, int baseline_count, FileEntry *current_files, int current_count, char **buffer, size_t *size);
 void alert(char **buffer, size_t *size, const char *message, const char *file);
 int is_suspicious_change(const FileEntry *original, const FileEntry *current);
 int compare_paths(const void *a, const void *b);
+BaselineInfo *buscar_o_crear_baseline(const char *mount_path);
 
 char *generar_reporte_usb() {
     char *buffer = NULL;
@@ -50,40 +69,36 @@ char *generar_reporte_usb() {
     buffer = agregar_texto(buffer, &size, "==== RESULTADOS DEL ESCANEO DE PUERTOS ====\n\n\n");
 
     for (int m = 0; m < num_dirs; m++) {
-        if ((dir = opendir(mount_dirs[m])) == NULL) {
-            continue;
-        }
+        if (stat(mount_dirs[m], &stat_buf) == -1 || !S_ISDIR(stat_buf.st_mode)) continue;
+
+        dir = opendir(mount_dirs[m]);
+        if (!dir) continue;
 
         while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-                continue;
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
             char mount_path[MAX_PATH];
             snprintf(mount_path, sizeof(mount_path), "%s/%s", mount_dirs[m], entry->d_name);
 
-            // Usar stat para verificar si es directorio
-            if (stat(mount_path, &stat_buf) == -1) {
-                continue;
-            }
-            if (!S_ISDIR(stat_buf.st_mode)) {
-                continue;
-            }
+            if (stat(mount_path, &stat_buf) == -1 || !S_ISDIR(stat_buf.st_mode)) continue;
 
-            buffer = agregar_texto(buffer, &size, "Dispositivo conectado detectado en: %s\n", mount_path);
+            BaselineInfo *info = buscar_o_crear_baseline(mount_path);
+            if (!info) continue;
 
-            FileEntry *baseline = NULL;
-            int baseline_count = 0;
-            scan_directory(mount_path, &baseline, &baseline_count);
-            sleep(1);  // Simula tiempo entre escaneos
+            buffer = agregar_texto(buffer, &size, "Dispositivo detectado: %s\n", mount_path);
+            total_files_scanned = 0;
 
             FileEntry *current_files = NULL;
-            int current_count = 0;
-            scan_directory(mount_path, &current_files, &current_count);
+            int current_count = 0, capacity = 100;
+            scan_directory(mount_path, &current_files, &current_count, &capacity, 0);
 
-            detect_changes(baseline, baseline_count, current_files, current_count, &buffer, &size);
+            detect_changes(info->baseline, info->baseline_count, current_files, current_count, &buffer, &size);
 
-            free(baseline);
-            free(current_files);
+            // Actualizar baseline
+            free(info->baseline);
+            info->baseline = current_files;
+            info->baseline_count = current_count;
+            info->baseline_capacity = capacity;
         }
 
         closedir(dir);
@@ -93,62 +108,101 @@ char *generar_reporte_usb() {
     return buffer;
 }
 
+BaselineInfo *buscar_o_crear_baseline(const char *mount_path) {
+    for (int i = 0; i < num_dispositivos; i++) {
+        if (strcmp(dispositivos[i].mount_path, mount_path) == 0) {
+            return &dispositivos[i];
+        }
+    }
 
-void scan_directory(const char *path, FileEntry **out_list, int *out_count) {
-    DIR *dir;
+    if (num_dispositivos >= MAX_DEVICES) {
+        printf("Máximo número de dispositivos alcanzado.\n");
+        return NULL;
+    }
+
+    strncpy(dispositivos[num_dispositivos].mount_path, mount_path, MAX_PATH - 1);
+    dispositivos[num_dispositivos].baseline = NULL;
+    dispositivos[num_dispositivos].baseline_count = 0;
+    dispositivos[num_dispositivos].baseline_capacity = 0;
+    return &dispositivos[num_dispositivos++];
+}
+
+void scan_directory(const char *path, FileEntry **out_list, int *out_count, int *capacity, int depth) {
+    if (depth > MAX_DEPTH || total_files_scanned >= MAX_FILES_PER_SCAN) return;
+    if (access(path, R_OK | X_OK) == -1) return;
+
+    DIR *dir = opendir(path);
+    if (!dir) return;
+
     struct dirent *entry;
     char full_path[MAX_PATH];
 
-    FileEntry *files = malloc(100 * sizeof(FileEntry));
-    int capacity = 100;
-    int count = 0;
-
-    if ((dir = opendir(path)) == NULL) return;
+    if (!*out_list) {
+        *out_list = malloc(*capacity * sizeof(FileEntry));
+        if (!*out_list) {
+            closedir(dir);
+            return;
+        }
+        *out_count = 0;
+    }
 
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
         struct stat stat_buf;
-
-        if (lstat(full_path, &stat_buf) == -1) continue;
+        if (lstat(full_path, &stat_buf) == -1 || S_ISLNK(stat_buf.st_mode)) continue;
 
         if (S_ISDIR(stat_buf.st_mode)) {
-            scan_directory(full_path, &files, &count);
+            scan_directory(full_path, out_list, out_count, capacity, depth + 1);
         } else if (S_ISREG(stat_buf.st_mode)) {
-            if (count >= capacity) {
-                capacity *= 2;
-                files = realloc(files, capacity * sizeof(FileEntry));
-                if (!files) return;
+            if (stat_buf.st_size > MAX_FILE_SIZE) continue;
+
+            if (*out_count >= *capacity) {
+                *capacity *= 2;
+                FileEntry *tmp = realloc(*out_list, *capacity * sizeof(FileEntry));
+                if (!tmp) {
+                    closedir(dir);
+                    return;
+                }
+                *out_list = tmp;
             }
 
-            FileEntry *file = &files[count];
-            strncpy(file->path, full_path, MAX_PATH);
+            FileEntry *file = &(*out_list)[*out_count];
+            strncpy(file->path, full_path, MAX_PATH - 1);
+            file->path[MAX_PATH - 1] = '\0';
             file->size = stat_buf.st_size;
             file->permissions = stat_buf.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
             file->uid = stat_buf.st_uid;
             file->gid = stat_buf.st_gid;
             file->mtime = stat_buf.st_mtime;
-            compute_sha256(full_path, file->hash);
-            count++;
+            compute_sha256(full_path, file->hash, stat_buf.st_size);
+
+            (*out_count)++;
+            total_files_scanned++;
+            if (total_files_scanned >= MAX_FILES_PER_SCAN) break;
         }
     }
+
     closedir(dir);
-    *out_list = files;
-    *out_count = count;
 }
 
-void compute_sha256(const char *file_path, char *output) {
+void compute_sha256(const char *file_path, char *output, off_t file_size) {
     FILE *file = fopen(file_path, "rb");
-    if (!file) return;
+    if (!file) {
+        strcpy(output, "ERROR");
+        return;
+    }
 
     SHA256_CTX context;
     SHA256_Init(&context);
 
     unsigned char buffer[4096];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file))) {
+    size_t bytes_read, total_read = 0;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         SHA256_Update(&context, buffer, bytes_read);
+        total_read += bytes_read;
+        if (total_read > MAX_HASH_BYTES) break;
     }
 
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -168,8 +222,7 @@ void detect_changes(FileEntry *baseline, int baseline_count, FileEntry *current_
     qsort(baseline, baseline_count, sizeof(FileEntry), compare_paths);
     qsort(current_files, current_count, sizeof(FileEntry), compare_paths);
 
-    int i = 0, j = 0;
-    int changed = 0;
+    int i = 0, j = 0, changed = 0;
 
     while (i < baseline_count || j < current_count) {
         if (i < baseline_count && (j == current_count || strcmp(baseline[i].path, current_files[j].path) < 0)) {
@@ -184,7 +237,6 @@ void detect_changes(FileEntry *baseline, int baseline_count, FileEntry *current_
             if (strcmp(baseline[i].hash, current_files[j].hash) != 0 ||
                 baseline[i].size != current_files[j].size ||
                 baseline[i].mtime != current_files[j].mtime) {
-
                 alert(buffer, size, "Archivo modificado", current_files[j].path);
                 if (is_suspicious_change(&baseline[i], &current_files[j])) {
                     alert(buffer, size, "CAMBIO SOSPECHOSO detectado", current_files[j].path);
@@ -217,7 +269,9 @@ void alert(char **buffer, size_t *size, const char *message, const char *file) {
 
     if (file) {
         *buffer = agregar_texto(*buffer, size, "[%s] ALERTA: %s\n    Archivo: %s\n", timestamp, message, file);
+        printf("[%s] %s - %s\n", timestamp, message, file);
     } else {
         *buffer = agregar_texto(*buffer, size, "[%s] ALERTA: %s\n", timestamp, message);
+        printf("[%s] %s\n", timestamp, message);
     }
 }
