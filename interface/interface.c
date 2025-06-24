@@ -32,7 +32,6 @@ gboolean actualizar_pestanas(gpointer data) {
     actualizar_buffer(procesos_buffer, procesos);
 
     free(puertos);
-    free(usb);
     free(procesos);
     pthread_mutex_unlock(&lock);
     return G_SOURCE_CONTINUE; // sigue llamándose periódicamente

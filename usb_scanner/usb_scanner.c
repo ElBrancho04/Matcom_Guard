@@ -11,7 +11,6 @@
 #include <errno.h>
 #include <pwd.h>
 #include <grp.h>
-#include <unistd.h>
 #include "../utils/utils.h"
 
 #define MOUNT_DIR "/media/abraham"
@@ -41,6 +40,7 @@ typedef struct {
     FileEntry *baseline;
     int baseline_count;
     int baseline_capacity;
+    int escaneo_inicial_realizado;
 } BaselineInfo;
 
 #define MAX_DEVICES 10
@@ -54,11 +54,12 @@ void detect_changes(FileEntry *baseline, int baseline_count, FileEntry *current_
 void alert(char **buffer, size_t *size, const char *message, const char *file);
 int is_suspicious_change(const FileEntry *original, const FileEntry *current);
 int compare_paths(const void *a, const void *b);
-BaselineInfo *buscar_o_crear_baseline(const char *mount_path);
+BaselineInfo *buscar_o_crear_baseline(const char *mount_path, char **buffer, size_t *size);
 
 char *generar_reporte_usb() {
-    char *buffer = NULL;
-    size_t size = 0;
+    static char *buffer_general = NULL;
+    static size_t size_general = 0;
+
     DIR *dir;
     struct dirent *entry;
     struct stat stat_buf;
@@ -66,7 +67,8 @@ char *generar_reporte_usb() {
     const char *mount_dirs[] = { MOUNT_DIR, ALT_MOUNT_DIR };
     int num_dirs = sizeof(mount_dirs) / sizeof(mount_dirs[0]);
 
-    buffer = agregar_texto(buffer, &size, "==== RESULTADOS DEL ESCANEO DE PUERTOS ====\n\n\n");
+    if (!buffer_general)
+    buffer_general = agregar_texto(buffer_general, &size_general, "==== ESCANEO DE PUERTOS USB ====\n");
 
     for (int m = 0; m < num_dirs; m++) {
         if (stat(mount_dirs[m], &stat_buf) == -1 || !S_ISDIR(stat_buf.st_mode)) continue;
@@ -82,20 +84,26 @@ char *generar_reporte_usb() {
 
             if (stat(mount_path, &stat_buf) == -1 || !S_ISDIR(stat_buf.st_mode)) continue;
 
-            BaselineInfo *info = buscar_o_crear_baseline(mount_path);
+            BaselineInfo *info = buscar_o_crear_baseline(mount_path, &buffer_general, &size_general);
             if (!info) continue;
 
-            buffer = agregar_texto(buffer, &size, "Dispositivo detectado: %s\n", mount_path);
             total_files_scanned = 0;
 
             FileEntry *current_files = NULL;
             int current_count = 0, capacity = 100;
             scan_directory(mount_path, &current_files, &current_count, &capacity, 0);
 
-            detect_changes(info->baseline, info->baseline_count, current_files, current_count, &buffer, &size);
+            if (!current_files) continue;  // Protección extra si el escaneo falló
 
-            // Actualizar baseline
-            free(info->baseline);
+            if (info->escaneo_inicial_realizado) {
+                detect_changes(info->baseline, info->baseline_count, current_files, current_count, &buffer_general, &size_general);
+                free(info->baseline);  // solo si ya fue usado antes
+            } else {
+                buffer_general = agregar_texto(buffer_general, &size_general, "  Escaneo inicial realizado, baseline establecido.\n");
+                info->escaneo_inicial_realizado = 1;
+            }
+
+            // Siempre actualizamos el baseline, pero ya liberamos el anterior si hacía falta
             info->baseline = current_files;
             info->baseline_count = current_count;
             info->baseline_capacity = capacity;
@@ -104,27 +112,30 @@ char *generar_reporte_usb() {
         closedir(dir);
     }
 
-    buffer = agregar_texto(buffer, &size, "\n===========================================\n");
-    return buffer;
+    return buffer_general;
 }
 
-BaselineInfo *buscar_o_crear_baseline(const char *mount_path) {
+BaselineInfo *buscar_o_crear_baseline(const char *mount_path, char **buffer, size_t *size) {
     for (int i = 0; i < num_dispositivos; i++) {
         if (strcmp(dispositivos[i].mount_path, mount_path) == 0) {
             return &dispositivos[i];
         }
     }
 
-    if (num_dispositivos >= MAX_DEVICES) {
-        printf("Máximo número de dispositivos alcanzado.\n");
-        return NULL;
+    if (num_dispositivos >= MAX_DEVICES) return NULL;
+
+    BaselineInfo *nuevo = &dispositivos[num_dispositivos++];
+    strncpy(nuevo->mount_path, mount_path, MAX_PATH - 1);
+    nuevo->baseline = NULL;
+    nuevo->baseline_count = 0;
+    nuevo->baseline_capacity = 0;
+    nuevo->escaneo_inicial_realizado = 0;
+
+    if (buffer && size) {
+        *buffer = agregar_texto(*buffer, size, "Dispositivo detectado: %s\n", mount_path);
     }
 
-    strncpy(dispositivos[num_dispositivos].mount_path, mount_path, MAX_PATH - 1);
-    dispositivos[num_dispositivos].baseline = NULL;
-    dispositivos[num_dispositivos].baseline_count = 0;
-    dispositivos[num_dispositivos].baseline_capacity = 0;
-    return &dispositivos[num_dispositivos++];
+    return nuevo;
 }
 
 void scan_directory(const char *path, FileEntry **out_list, int *out_count, int *capacity, int depth) {
@@ -269,9 +280,7 @@ void alert(char **buffer, size_t *size, const char *message, const char *file) {
 
     if (file) {
         *buffer = agregar_texto(*buffer, size, "[%s] ALERTA: %s\n    Archivo: %s\n", timestamp, message, file);
-        printf("[%s] %s - %s\n", timestamp, message, file);
     } else {
         *buffer = agregar_texto(*buffer, size, "[%s] ALERTA: %s\n", timestamp, message);
-        printf("[%s] %s\n", timestamp, message);
     }
 }
